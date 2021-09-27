@@ -1,255 +1,582 @@
-import jose from 'node-jose';
-import express from 'express';
-
-import resources from './resources.json';
-
-import base64url from 'base64url';
-import crypto, { randomUUID } from 'crypto';
-
-const PORT = parseInt(process.env.PORT || "3000")
-const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`
-
-import ExpressServeStaticCore from 'express-serve-static-core/index'
-
-
 type QrLinkPayloadFlag = "L" | "O" | "P" | "";
 interface QrLinkPayload {
-    gnap: {
-        url: string,
-        access: string
-    },
-    exp?: number,
-    flags?: `${QrLinkPayloadFlag}${QrLinkPayloadFlag}${QrLinkPayloadFlag}`,
-    decrypt?: string
+  gnap: {
+    url: string;
+    access: string;
+  };
+  exp?: number;
+  flags?: `${QrLinkPayloadFlag}${QrLinkPayloadFlag}${QrLinkPayloadFlag}`;
+  decrypt?: string;
 }
 
-interface AccessTokenPayload {
-    label: string,
-    access: [{
-        locations: string[]
-    } | string]
+type GnapRARItemReference = string;
+interface GnapAccessToken {
+  value: string;
+  manage?: string;
+  access: (GnapRARItem | GnapRARItemReference)[];
 }
 
-const app = express()
+interface GnapAccessTokenResponse {
+  access_token: GnapAccessToken | GnapAccessToken[];
+}
 
-app.use(express.raw({type: "application/jose"}))
+type GnapAccessTokenResponseSingle = GnapAccessTokenResponse & { access_token: GnapAccessToken };
 
+// TODO refactor policy stores to use this structure
+type SHCPackageAccessPolicy = {
+  who: { type: "keyholder"; keyThumbprint: string } | { type: "anyone" };
+  package?: string;
+  permission: "claim" | "view" | "manage" | "initialize";
+};
 
-app.get('/', (req, res) => {
-  res.json(resources);
-})
+type PolicyInputs = [
+  accessRequest: GnapRARItem | GnapRARItemReference,
+  gnapPayload: GnapTxPayload,
+  clientAccessFromToken: GnapAccessToken | null
+];
+type PolicyFunction = (...inputs: PolicyInputs) => Promise<null | {
+  grantedAccess: (GnapRARItem | GnapRARItemReference)[];
+  enablingPolicies: SHCPackageAccessPolicy[];
+}>;
+
+type GnapRARItemType = "shclink-read" | "shclink-modify" | "shclink-share";
+interface GnapRARItem {
+  type: GnapRARItemType;
+  actions?: ("GET" | "DELETE" | "POST" | "PUT")[];
+  locations: string[];
+  datatypes?: ("application/smart-health-card" | "application/fhir+json")[];
+}
 
 interface GnapClient {
-        class_id?: string,
-        display?: {
-            name?: string,
-            uri?: string
-        }
-        key: {
-            proof: "jws",
-            jwk: {
-                kty: "EC",
-                kid: string,
-                use: "sig",
-                alg: "ES256"
-            }
-        }
-
+  class_id?: string;
+  display?: {
+    name?: string;
+    uri?: string;
+  };
+  proof: "jws";
+  key: {
+    jwk: {
+      kty: "EC";
+      kid: string;
+      use: "sig";
+      alg: "ES256";
+    };
+  };
 }
 interface GnapTxPayload {
-    access_token: {
-        access: string[]
-    },
-    client: GnapClient
+  access_token: {
+    access: GnapAccessToken["access"];
+  };
+  client: GnapClient;
+  shclink?: {
+    pin?: string;
+  };
 }
-
-const clients = {}
-
-const gnapAuthorized: ExpressServeStaticCore.RequestHandler = async (req, res, next) =>  {
-    const jwsRaw = req.body as Buffer;
-
-    try {
-        const jws = jwsRaw.toString();
-        const unverifiedPayload = JSON.parse(base64url.decode(jws.split(".")[1]));
-        const newClientKey = await jose.JWK.asKey(unverifiedPayload.client.key);
-
-        const verifiedJws = await jose.JWS.createVerify(newClientKey).verify(jws);
-        const verifiedHeader = verifiedJws.header as {htm: string, kid: string, uri: string, ath?: string, created: number}
-        const verifiedPayload = JSON.parse(verifiedJws.payload.toString())
-
-        if (verifiedHeader['htm'] !== req.method) {
-            throw `Failed htm ${verifiedHeader.htm} vs ${req.method}`
-        }
-
-        if (verifiedHeader['uri'] !== `${PUBLIC_URL}${req.url}`) {
-            throw `${PUBLIC_URL}${req.url} vs ${verifiedHeader['uri']}`
-        }
-
-        if ( Math.abs((new Date().getTime()) / 1000  - verifiedHeader.created) > 300) {
-            throw `Authn token created more than 300 seconds away from current time`
-        }
-        
-        //TODO add check for ath when present
-
-        let gnapRequest = req as any;
-        gnapRequest.gnap = {
-            verified: true,
-            body: verifiedPayload
-        }
-
-    } catch(e: any) {
-        res.json(e.toString());
-        next(e);
-    }
-
-    next()
-}
-
-const registeredQrs: Record<string, GnapRARItem> = {
-    'secret-access-value-123': {
-        locations: [`${PUBLIC_URL}/data/by-policy/glucose.json`]
-    }
-}
-
-const validateAccessKey = async(accessKey: string): Promise<GnapRARItem> => {
-    if (registeredQrs[accessKey]) {
-        return registeredQrs[accessKey]
-    }
-
-    throw "Not found"
-}
-
-interface GnapAccessToken {
-    value: string,
-    manage?: string,
-    access: GnapRARItem[]
-}
-
-const approvedAccessTokens: Record<string, GnapAccessToken> = {
-
-}
-
-const generateAccessToken = async (access: GnapRARItem): Promise<GnapAccessToken> => {
-
-    let value = randomUUID();
-    approvedAccessTokens[value] = {
-        value,
-        access: [access]
-    }
-
-    return approvedAccessTokens[value];
-}
-
-app.post('/gnap', gnapAuthorized, async (req, res) => {
-    console.log("gnap", (req as any).gnap.body);
-
-    try {
-        const gnapRequestBody: GnapTxPayload = (req as any).gnap.body;
-        const qr = await Promise.all(gnapRequestBody.access_token.access.map(validateAccessKey))
-        console.log("QR", qr)
-        const tokenResponse = await generateAccessToken(qr[0])
-        return res.json({
-            access_token: [tokenResponse]
-        })
-    } catch (e) {
-        return res.json(e);
-    }
-
-
-    // TODO verify the claims inside or throw
-})
-
-app.get('/data/by-policy/:deets.json', async (req, res) => {
-    const policy = new RegExp(req.params['deets'], "i");
-    const filtered = resources.entry.filter(r => JSON.stringify(r).match(policy));
-    console.log("pp", policy, resources.entry.length, filtered.length)
-    res.json({...resources, entry: filtered});
-})
-
-app.get('/open/data/by-policy/:deets.json', async (req, res) => {
-    const policy = new RegExp(req.params['deets'], "i");
-    const filtered = resources.entry.filter(r => JSON.stringify(r).match(policy));
-    console.log("pp", policy, resources.entry.length, filtered.length)
-    res.json({...resources, entry: filtered});
-})
-
-
-app.listen(PORT, () => {
-  console.log(`Example app listening at http://localhost:${PORT}`)
-})
 
 interface GnapJwsHeaders {
-    typ: "gnap-binding+jws",
-    htm: string,
-    uri: string,
-    created: number,
-    ath?: string
+  typ: "gnap-binding+jws";
+  htm: string;
+  uri: string;
+  created: number;
+  ath?: string;
 }
-const signJwsAttached = async (key: jose.JWK.Key, method: string, uri: string, payload?: object, accessTokenValue?: string): Promise<string> => {
-    const headers: GnapJwsHeaders = {
-        typ: "gnap-binding+jws",
-        htm: method,
-        uri: uri,
-        created: Math.floor((new Date().getTime())/1000),
+
+interface ExpressRequestGnap {
+  verified: boolean;
+  body: GnapTxPayload | QrPolicy_CreateRequestBody; // TODO figure out how to make this generic
+  accessFromToken: GnapAccessToken | null;
+}
+interface QrPolicy {
+  needPin?: string;
+  claimLimit: number;
+  claims: {
+    active: boolean;
+    client: GnapClient;
+  }[];
+  access: GnapRARItem[];
+}
+
+interface QrPolicy_CreateRequestBody {
+  needPin?: string;
+  claimLimit: number;
+  locations: string[];
+}
+
+import jose from "node-jose";
+import express from "express";
+import resources from "./resources.json";
+import base64url from "base64url";
+import crypto, { randomUUID } from "crypto";
+import fetch from "node-fetch";
+
+const PORT = parseInt(process.env.PORT || "3000");
+const PUBLIC_URL = process.env.PUBLIC_URL || `http://localhost:${PORT}`;
+
+import ExpressServeStaticCore from "express-serve-static-core/index";
+
+const app = express();
+
+app.use(express.raw({ type: "application/jose" }));
+
+app.get("/", (req, res) => {
+  res.json(resources);
+});
+
+async function introspect(accessTokenValue: string): Promise<DbAccessTokenRecord> {
+  return approvedAccessTokens[accessTokenValue];
+}
+
+const gnapAuthorized: ExpressServeStaticCore.RequestHandler = async (req, res, next) => {
+  const jwsRaw = req.body as Buffer;
+
+  try {
+    const jws = ["HEAD", "OPTIONS", "GET"].includes(req.method) ? (req.headers["detached-jws"] as string) : jwsRaw.toString();
+
+    if (!jws) {
+      throw `No JWS found in body or header to authenticate request`;
+    }
+
+    let withAccessToken: string | null = null;
+    let accessFromToken = null;
+    let client: GnapClient;
+    if (req.headers["authorization"]?.startsWith("GNAP ")) {
+      withAccessToken = req.headers["authorization"].slice(5);
+      accessFromToken = await introspect(withAccessToken);
+      client = accessFromToken.boundClient;
+    } else {
+      const unverifiedPayload = JSON.parse(base64url.decode(jws.split(".")[1]));
+      client = unverifiedPayload.client;
+    }
+
+    const newClientKey = await jose.JWK.asKey(client.key);
+    const verifiedJws = await jose.JWS.createVerify(newClientKey).verify(jws);
+    const verifiedHeader = verifiedJws.header as { htm: string; kid: string; uri: string; ath?: string; created: number };
+    const verifiedPayload = verifiedJws.payload.toString();
+
+    if (withAccessToken) {
+      const expectedAth = base64url.encode(crypto.createHash("sha256").update(withAccessToken).digest());
+      if (verifiedHeader.ath !== expectedAth) {
+        throw `Expected ath ${expectedAth} in header but received ${verifiedHeader.ath}`;
+      }
+    }
+
+    if (verifiedHeader.htm !== req.method) {
+      throw `Failed htm ${verifiedHeader.htm} vs ${req.method}`;
+    }
+
+    if (verifiedHeader.uri !== `${PUBLIC_URL}${req.url}`) {
+      throw `${PUBLIC_URL}${req.url} vs ${verifiedHeader["uri"]}`;
+    }
+
+    if (Math.abs(new Date().getTime() / 1000 - verifiedHeader.created) > 300) {
+      throw `Signed request created more than 300 seconds away from current time`;
+    }
+
+    req.gnap = {
+      verified: true,
+      body: verifiedPayload ? JSON.parse(verifiedPayload) : null,
+      accessFromToken: accessFromToken?.accessToken ?? null,
     };
 
-    if (accessTokenValue) {
-        headers.ath = base64url.encode(crypto.createHash('sha256').update(accessTokenValue).digest())
+    next();
+  } catch (e: any) {
+    res.json(e.toString());
+    next(e);
+  }
+};
+
+const registeredQrs: Record<string, QrPolicy> = {
+  "secret-access-value-123": {
+    claimLimit: 1,
+    claims: [],
+    access: [
+      {
+        type: "shclink-read",
+        locations: [`${PUBLIC_URL}/data/by-policy/glucose.json`],
+      },
+    ],
+  },
+};
+
+interface DbAccessTokenRecord {
+  expirationTime: number; // epoch seconds
+  accessToken: GnapAccessToken;
+  enablingPolicies: SHCPackageAccessPolicy[];
+  boundClient: GnapClient;
+}
+
+const approvedAccessTokens: Record<string, DbAccessTokenRecord> = {};
+const saveAccessToken = async (
+  accessToken: GnapAccessToken,
+  enablingPolicies: SHCPackageAccessPolicy[],
+  boundClient: GnapClient
+): Promise<boolean> => {
+  approvedAccessTokens[accessToken.value] = {
+    expirationTime: new Date().getTime() / 1000 + 300,
+    accessToken: accessToken,
+    enablingPolicies: enablingPolicies,
+    boundClient,
+  };
+  return true;
+};
+
+const anyoneCanInitializeShcPackage: PolicyFunction = async (accessRequest, gnapPayload, clientAccess) => {
+  if (accessRequest === "shclink-initialize") {
+    const folderUuid = randomUUID();
+    console.log("Anone can", gnapPayload);
+    const clientId = gnapPayload.client.key.jwk.kid;
+    /*
+    registeredQrs[folderUuid] = {
+      claimLimit: 3,
+      claims: [],
+      acccess: {}
     }
+    */
 
-    const sig = await jose.JWS.createSign({format: "compact", fields: headers}, key).update(JSON.stringify(payload)).final() as unknown as string;
-
-    return sig
-}
- 
-interface GnapRARItem {
-    actions?: ("read")[]
-    locations: string[],
-    datatypes?: ("application/smart-health-card" | "application/fhir+json")[]
-}
-
-interface GnapRegistrationRequest {
-    access: GnapRARItem,
-    client: GnapClient
-}
-
-interface GnapRegistrationResponse {
-    resource_reference: string
-}
-
-const registerResourceSet = async (filePath: string): Promise<GnapRegistrationResponse> => {
     return {
-        resource_reference: `fixme-encrypt-${filePath}`
+      grantedAccess: [
+        {
+          type: "shclink-modify",
+          actions: ["POST", "GET", "PUT", "DELETE"],
+          locations: [`${PUBLIC_URL}/shclinks/${clientId}/${folderUuid}/data`],
+        },
+        {
+          type: "shclink-share",
+          actions: ["POST", "GET", "PUT", "DELETE"],
+          locations: [`${PUBLIC_URL}/shclinks/${clientId}/${folderUuid}/policy`],
+        },
+      ],
+      enablingPolicies: [
+        {
+          who: { type: "anyone" },
+          permission: "initialize",
+        },
+      ],
+    };
+  }
+  return null;
+};
+
+const creatorCanManageShcPackage: PolicyFunction = async (accessRequest, gnapPayload, clientAcces) => {
+  if (typeof accessRequest === "object") {
+    if (["shclink-modify", "shclink-share"].includes(accessRequest.type)) {
+      const clientId = gnapPayload.client.key.jwk.kid;
+      const allowedLocationPrefix = `${PUBLIC_URL}/shclinks/${clientId}/`;
+      if (accessRequest.locations.every((l) => l.startsWith(allowedLocationPrefix))) {
+        return {
+          grantedAccess: [accessRequest],
+          enablingPolicies: [
+            {
+              who: { type: "keyholder", keyThumbprint: clientId },
+              permission: "manage",
+              package: clientId, // TODO use folders instead of entire clinet spaces
+            },
+          ],
+        };
+      }
     }
+  }
+  return null;
+};
+
+const anyoneCanClaimActiveQr: PolicyFunction = async (accessRequest, gnapPayload, clientAcces) => {
+  if (typeof accessRequest === "string") {
+    let qrPolicy = registeredQrs[accessRequest];
+    if (!qrPolicy.needPin || qrPolicy.needPin === gnapPayload?.shclink?.pin) {
+      if (qrPolicy.claimLimit > qrPolicy.claims.length) {
+        qrPolicy.claims.push({ active: true, client: gnapPayload.client });
+        return {
+          grantedAccess: qrPolicy.access,
+          enablingPolicies: qrPolicy.access.map((p) => ({
+            who: { type: "anyone" },
+            permission: "claim",
+            package: accessRequest,
+          })),
+        };
+      }
+    }
+  }
+  return null;
+};
+
+/* Maybe with long access token lifetimes, we don't need to support refreshing (?)
+const previousQrClaimantCanReadUntilDeactivated: PolicyFunction = async (accessRequest, gnapPayload, clientAcces) => {
+  if (typeof accessRequest === "object") {
+    if (accessRequest.type === "shclink-read") {
+      const clientIsPreviousClaimant = Object.values(registeredQrs).some(
+        (v) =>
+          v.access.some((a) => accessRequest.locations.every((l) => a.locations.includes(l))) &&
+          v.claims.some((c) => c.active && c.client.key.jwk.kid === gnapPayload.client.key.jwk.kid)
+      );
+      if (clientIsPreviousClaimant) {
+        return [accessRequest];
+      }
+    }
+  }
+  return [];
+};
+*/
+
+function firstPolicyWins(...policies: PolicyFunction[]): PolicyFunction {
+  return async (...inputs: PolicyInputs) => {
+    for (let p of policies) {
+      const results = await p(...inputs);
+      if (results?.grantedAccess?.length) {
+        return results;
+      }
+    }
+    return null;
+  };
 }
+
+/*
+TODO next steps on resoruce API
+addQrPolicy:
+  post-condition: new policy: [anonymous, package, 'claim']
+  * protected by Gnap access token with the right permissions
+  * ensure that all 'read' locations sit within the policy bucket 
+
+*/
+
+declare module "express-serve-static-core" {
+  export interface Request {
+    gnap: ExpressRequestGnap;
+  }
+}
+
+// TODO Separate out policies from packages, so one package can have >1 QR policy at a time
+app.get("/shclinks/:clientId/:packageId/data/:file", gnapAuthorized, async (req, res) => {
+  try {
+    if (
+      !req.gnap.accessFromToken?.access.some(
+        (a) => typeof a === "object" && a.type === "shclink-read" && a.locations.some((l) => l === `${PUBLIC_URL}${req.url}`)
+      )
+    ) {
+      throw `Supplied access token ${JSON.stringify(req.gnap.accessFromToken)} does not provide access to ${req.url}`;
+    }
+
+    const fhirFilter = new RegExp(req.params.file.replace(".json", ""), "i");
+    const filtered = resources.entry.filter((r) => JSON.stringify(r).match(fhirFilter));
+    console.log("pp", fhirFilter, resources.entry.length, filtered.length);
+    res.json({ ...resources, entry: filtered });
+  } catch (e: any) {
+    res.status(500);
+    res.json(e.toString());
+  }
+});
+
+app.put("/shclinks/:clientId/:packageId/policy", gnapAuthorized, async (req, res) => {
+  try {
+    if (
+      !req.gnap.accessFromToken?.access.some(
+        (a) => typeof a === "object" && a.type === "shclink-share" && a.locations.some((l) => l === `${PUBLIC_URL}${req.url}`)
+      )
+    ) {
+      throw `Supplied access token ${JSON.stringify(req.gnap.accessFromToken)} does not provide access to ${req.url}`;
+    }
+
+    const policyRequest = req.gnap.body as QrPolicy_CreateRequestBody;
+    const allowedDataLocations = `${PUBLIC_URL}${req.url}`.replace(/\/policy$/, "/data/");
+    if (!policyRequest.locations.every((l) => l.startsWith(allowedDataLocations))) {
+      throw `requested access to a data location ${policyRequest.locations} outside of managed package ${allowedDataLocations}`;
+    }
+
+    registeredQrs[req.params.packageId] = {
+      needPin: policyRequest.needPin,
+      claimLimit: policyRequest.claimLimit,
+      claims: [],
+      access: [
+        {
+          type: "shclink-read",
+          locations: policyRequest.locations,
+        },
+      ],
+    };
+
+    // Blow away any access tokens baesd on now-invalid claims
+    // TODO: determine access token validity during the introspect
+    // stage, as a function of stated policies
+    Object.entries(approvedAccessTokens).forEach(([k, v]) => {
+      if (v.enablingPolicies.some((p) => p.package === req.params.packageId && p.permission === "claim")) {
+        delete approvedAccessTokens[k];
+      }
+    });
+
+    return res.json({
+      status: "PUT new policy",
+      gnap: {
+        url: `${PUBLIC_URL}/gnap`,
+        access: req.params.packageId,
+      },
+      _internalStateDebugRegistered: registeredQrs[req.params.packageId],
+    });
+  } catch (e: any) {
+    res.status(500);
+    res.json(e.toString());
+  }
+});
+
+app.post("/gnap", gnapAuthorized, async (req, res) => {
+  try {
+    const expressRequestGnap = req.gnap;
+    const gnapRequestBody = req.gnap.body as GnapTxPayload;
+    console.log("Parsed gnap body", JSON.stringify(gnapRequestBody, null, 2));
+    const value = randomUUID();
+
+    console.log("Considering", req.gnap);
+
+    const policy = firstPolicyWins(
+      anyoneCanInitializeShcPackage,
+      creatorCanManageShcPackage,
+      anyoneCanClaimActiveQr
+      //previousQrClaimantCanReadUntilDeactivated
+    );
+
+    let grantedAccess: GnapAccessTokenResponseSingle["access_token"]["access"] = [];
+    let enablingPolicies: SHCPackageAccessPolicy[] = [];
+    for (let a of gnapRequestBody.access_token.access) {
+      const policyResult = await policy(a, gnapRequestBody, expressRequestGnap.accessFromToken);
+      if (policyResult !== null) {
+        grantedAccess = grantedAccess.concat(policyResult.grantedAccess);
+        enablingPolicies = enablingPolicies.concat(policyResult.enablingPolicies);
+      }
+    }
+
+    const response: GnapAccessTokenResponseSingle = {
+      access_token: {
+        value,
+        access: grantedAccess,
+      },
+    };
+
+    console.log("saving access token resonse", response);
+    await saveAccessToken(response.access_token, enablingPolicies, gnapRequestBody.client);
+    res.json(response);
+  } catch (e) {
+    console.log("ERROR", e);
+    res.status(500);
+    return res.send(e);
+  }
+  // TODO verify the claims inside or throw
+});
+
+app.get("/open/data/by-policy/:deets.json", async (req, res) => {
+  const policy = new RegExp(req.params["deets"], "i");
+  const filtered = resources.entry.filter((r) => JSON.stringify(r).match(policy));
+  console.log("pp", policy, resources.entry.length, filtered.length);
+  res.json({ ...resources, entry: filtered });
+});
+
+app.listen(PORT, () => {
+  console.log(`Example app listening at http://localhost:${PORT}`);
+});
+
+const signJwsAttached = async (
+  key: jose.JWK.Key,
+  method: string,
+  uri: string,
+  payload?: object,
+  accessTokenValue?: string
+): Promise<string> => {
+  const headers: GnapJwsHeaders = {
+    typ: "gnap-binding+jws",
+    htm: method,
+    uri: uri,
+    created: Math.floor(new Date().getTime() / 1000),
+  };
+
+  if (accessTokenValue) {
+    headers.ath = base64url.encode(crypto.createHash("sha256").update(accessTokenValue).digest());
+  }
+
+  const sig = (await jose.JWS.createSign({ format: "compact", fields: headers }, key)
+    .update(JSON.stringify(payload))
+    .final()) as unknown as string;
+  return sig;
+};
+
+const signedFetch =
+  (key: jose.JWK.Key, accessTokenValue?: string) =>
+  async (
+    url: string,
+    {
+      method,
+      body,
+    }: {
+      method: string;
+      body: object;
+    }
+  ) => {
+    const jws = await signJwsAttached(key, method, url, body, accessTokenValue);
+
+    if (["HEAD", "OPTIONS", "GET"].includes(method)) {
+      return fetch(url, {
+        method,
+        headers: {
+          "Detached-JWS": jws,
+        },
+      });
+    }
+
+    return fetch(url, {
+      method,
+      headers: {
+        "Content-Type": "application/jose",
+      },
+      body: jws,
+    });
+  };
 
 async function prep() {
-    // const jwkEncrypt = (await jose.JWK.createKey("EC", "P-256", {"use": "enc", "alg": "ECDH-ES", "enc": "A256GCM"}));
-    // console.log("JWK", jwkEncrypt)
-    const jwkSign = (await jose.JWK.createKey("EC", "P-256", {"alg": "ES256", "use": "sig"}));
-    console.log("JWK", jwkSign)
-    // const pinJwe = await jose.JWE.createEncrypt({format: "compact", contentAlg: "A256GCM"}, jwkEncrypt,).update("1234").final();
-    // console.log("PIN", pinJwe)
-    const sig = await jose.JWS.createSign({format: "compact", fields: {}}, jwkSign).update(JSON.stringify({
-        authz: "https://server.example.org/gnap/tx",
-        access: "80b60365-1d5a-4001-afbc-a45e3a8415a4", // authz server will infer the issuer based on who registered this
-        exp: (new Date().getTime())/1000 + 60*5, // good for five minutes
-        flag: "PO"  // PIN required; One-time use
-    })).final() as unknown as string;
-    console.log("sig", sig, "\n", sig.length)
+  const jwkSign = await jose.JWK.createKey("EC", "P-256", { alg: "ES256", use: "sig" });
+  console.log("JWK", jwkSign);
 
-    const accessTokenRequestPayload: GnapTxPayload = {
-        access_token:  {
-            access: ["secret-access-value-123"]
-        },
-        client: {
-            key: jwkSign.toJSON(false) as GnapTxPayload['client']['key']
-        }
-    }
+  const accessTokenRequestPayload: GnapTxPayload = {
+    access_token: {
+      access: ["secret-access-value-123"],
+    },
+    client: {
+      proof: "jws",
+      key: jwkSign.toJSON(false) as GnapTxPayload["client"]["key"],
+    },
+  };
 
-    console.log("gnap tx jws attached", await signJwsAttached(jwkSign, "POST", "http://localhost:3000/gnap", accessTokenRequestPayload))
+  console.log(
+    "gnap tx jws attached",
+    await signJwsAttached(jwkSign, "POST", "http://localhost:3000/gnap", accessTokenRequestPayload)
+  );
 }
 
-// Register PIN at the same time as registering the resource set, so it doesn't need to flow through the QR
+// prep();
 
-prep()
+async function test() {
+  // TODO begin e2e tests in this sequence.
+  // * Generate a  Sharer client key
+  const sharerKey = await jose.JWK.createKey("EC", "P-256", { alg: "ES256", use: "sig" });
+
+  // * Initialize a package
+  const gnapRequest: GnapTxPayload = {
+    access_token: {
+      access: ["shclink-initialize"],
+    },
+    client: {
+      proof: "jws",
+      key: {
+        jwk: sharerKey.toJSON(false) as any,
+      },
+    },
+  };
+  const initializePackageResponse = await signedFetch(sharerKey)(`${PUBLIC_URL}/gnap`, {
+    method: "POST",
+    body: gnapRequest,
+  });
+
+  console.log("Initiailzied package", initializePackageResponse.status, await initializePackageResponse.json());
+
+  //const initializePackageResponse = fetch(prepareSignedRequest())
+  // * Declare a policy on the package bound to two JSON "files": /glucose.json and /vital.json
+  // * Generate a Receiver client key
+  // * Claim the package (i.e., request an access token)
+  // * Fetch the JSON files inside
+}
+test();
