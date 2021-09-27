@@ -31,7 +31,7 @@ type SHCPackageAccessPolicy = {
 
 type PolicyInputs = [
   accessRequest: GnapRARItem | GnapRARItemReference,
-  gnapPayload: GnapTxPayload,
+  gnapPayload: GnapTxRequestPayload,
   clientAccessFromToken: GnapAccessToken | null
 ];
 type PolicyFunction = (...inputs: PolicyInputs) => Promise<null | {
@@ -63,7 +63,7 @@ interface GnapClient {
     };
   };
 }
-interface GnapTxPayload {
+interface GnapTxRequestPayload {
   access_token: {
     access: GnapAccessToken["access"];
   };
@@ -73,6 +73,15 @@ interface GnapTxPayload {
   };
 }
 
+interface GnapTxResponsePayload {
+    access_token: {
+      value: string,
+      access: {
+        type: string,
+        locations: string[]
+      }[]
+    }
+  }
 interface GnapJwsHeaders {
   typ: "gnap-binding+jws";
   htm: string;
@@ -83,7 +92,7 @@ interface GnapJwsHeaders {
 
 interface ExpressRequestGnap {
   verified: boolean;
-  body: GnapTxPayload | QrPolicy_CreateRequestBody; // TODO figure out how to make this generic
+  body: GnapTxRequestPayload | QrPolicy_CreateRequestBody; // TODO figure out how to make this generic
   accessFromToken: GnapAccessToken | null;
 }
 interface QrPolicy {
@@ -148,7 +157,8 @@ const gnapAuthorized: ExpressServeStaticCore.RequestHandler = async (req, res, n
       client = unverifiedPayload.client;
     }
 
-    const newClientKey = await jose.JWK.asKey(client.key);
+    console.log("gnap req", withAccessToken, accessFromToken, client)
+    const newClientKey = await jose.JWK.asKey(client.key.jwk);
     const verifiedJws = await jose.JWS.createVerify(newClientKey).verify(jws);
     const verifiedHeader = verifiedJws.header as { htm: string; kid: string; uri: string; ath?: string; created: number };
     const verifiedPayload = verifiedJws.payload.toString();
@@ -367,6 +377,7 @@ app.get("/shclinks/:clientId/:packageId/data/:file", gnapAuthorized, async (req,
 
 app.put("/shclinks/:clientId/:packageId/policy", gnapAuthorized, async (req, res) => {
   try {
+    console.log("Encountered a share request")
     if (
       !req.gnap.accessFromToken?.access.some(
         (a) => typeof a === "object" && a.type === "shclink-share" && a.locations.some((l) => l === `${PUBLIC_URL}${req.url}`)
@@ -380,6 +391,8 @@ app.put("/shclinks/:clientId/:packageId/policy", gnapAuthorized, async (req, res
     if (!policyRequest.locations.every((l) => l.startsWith(allowedDataLocations))) {
       throw `requested access to a data location ${policyRequest.locations} outside of managed package ${allowedDataLocations}`;
     }
+
+    console.log("looks like a good request", req.params.packageId, req.gnap)
 
     registeredQrs[req.params.packageId] = {
       needPin: policyRequest.needPin,
@@ -411,6 +424,7 @@ app.put("/shclinks/:clientId/:packageId/policy", gnapAuthorized, async (req, res
       _internalStateDebugRegistered: registeredQrs[req.params.packageId],
     });
   } catch (e: any) {
+    console.log("Failed to create share policy", e)
     res.status(500);
     res.json(e.toString());
   }
@@ -419,7 +433,7 @@ app.put("/shclinks/:clientId/:packageId/policy", gnapAuthorized, async (req, res
 app.post("/gnap", gnapAuthorized, async (req, res) => {
   try {
     const expressRequestGnap = req.gnap;
-    const gnapRequestBody = req.gnap.body as GnapTxPayload;
+    const gnapRequestBody = req.gnap.body as GnapTxRequestPayload;
     console.log("Parsed gnap body", JSON.stringify(gnapRequestBody, null, 2));
     const value = randomUUID();
 
@@ -509,35 +523,42 @@ const signedFetch =
   ) => {
     const jws = await signJwsAttached(key, method, url, body, accessTokenValue);
 
+    const authzHeaders: Record<string, string> = {};
+    if (accessTokenValue) {
+      authzHeaders["Authorization"] = `GNAP ${accessTokenValue}` 
+    }
+
     if (["HEAD", "OPTIONS", "GET"].includes(method)) {
       return fetch(url, {
         method,
         headers: {
           "Detached-JWS": jws,
+          ...authzHeaders
         },
       });
     }
 
-    return fetch(url, {
+    return (await fetch(url, {
       method,
       headers: {
         "Content-Type": "application/jose",
+          ...authzHeaders
       },
       body: jws,
-    });
+    })).json();
   };
 
 async function prep() {
   const jwkSign = await jose.JWK.createKey("EC", "P-256", { alg: "ES256", use: "sig" });
   console.log("JWK", jwkSign);
 
-  const accessTokenRequestPayload: GnapTxPayload = {
+  const accessTokenRequestPayload: GnapTxRequestPayload = {
     access_token: {
       access: ["secret-access-value-123"],
     },
     client: {
       proof: "jws",
-      key: jwkSign.toJSON(false) as GnapTxPayload["client"]["key"],
+      key: jwkSign.toJSON(false) as GnapTxRequestPayload["client"]["key"],
     },
   };
 
@@ -555,7 +576,7 @@ async function test() {
   const sharerKey = await jose.JWK.createKey("EC", "P-256", { alg: "ES256", use: "sig" });
 
   // * Initialize a package
-  const gnapRequest: GnapTxPayload = {
+  const gnapRequest: GnapTxRequestPayload = {
     access_token: {
       access: ["shclink-initialize"],
     },
@@ -566,15 +587,35 @@ async function test() {
       },
     },
   };
+
   const initializePackageResponse = await signedFetch(sharerKey)(`${PUBLIC_URL}/gnap`, {
     method: "POST",
     body: gnapRequest,
-  });
+  }) as GnapTxResponsePayload;
 
-  console.log("Initiailzied package", initializePackageResponse.status, await initializePackageResponse.json());
+  console.log("Initialized package", JSON.stringify(initializePackageResponse, null, 2));
 
-  //const initializePackageResponse = fetch(prepareSignedRequest())
   // * Declare a policy on the package bound to two JSON "files": /glucose.json and /vital.json
+  const getLocationForType = (accessResponse: GnapTxResponsePayload, type: string) => accessResponse
+      .access_token
+      .access
+      .filter(a => a.type === type).flatMap(a => a.locations)[0];
+
+  const policyLocation = getLocationForType(initializePackageResponse, 'shclink-share')
+  const dataLocation = getLocationForType(initializePackageResponse, 'shclink-modify')
+
+  const createQrPolicyRequest: QrPolicy_CreateRequestBody = {
+    claimLimit: 1,
+    locations: [`${dataLocation}/glucose.json`, `${dataLocation}/vital-sign.json`]
+  };
+
+  const createQrPolicyResponse = await signedFetch(sharerKey, initializePackageResponse.access_token.value)(policyLocation, {
+    method: "PUT",
+    body: createQrPolicyRequest,
+  })
+
+  console.log("Shared package", JSON.stringify(await createQrPolicyResponse, null, 2));
+
   // * Generate a Receiver client key
   // * Claim the package (i.e., request an access token)
   // * Fetch the JSON files inside
