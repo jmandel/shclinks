@@ -518,8 +518,8 @@ const signedFetch =
       body,
     }: {
       method: string;
-      body: object;
-    }
+      body?: object;
+    } = {method: "GET", body: undefined}
   ) => {
     const jws = await signJwsAttached(key, method, url, body, accessTokenValue);
 
@@ -529,13 +529,13 @@ const signedFetch =
     }
 
     if (["HEAD", "OPTIONS", "GET"].includes(method)) {
-      return fetch(url, {
+      return (await fetch(url, {
         method,
         headers: {
           "Detached-JWS": jws,
           ...authzHeaders
         },
-      });
+      })).json();
     }
 
     return (await fetch(url, {
@@ -614,10 +614,45 @@ async function test() {
     body: createQrPolicyRequest,
   })
 
-  console.log("Shared package", JSON.stringify(await createQrPolicyResponse, null, 2));
+  console.log("Shared package", JSON.stringify(createQrPolicyResponse, null, 2));
 
   // * Generate a Receiver client key
+
+  const gnap = createQrPolicyResponse.gnap
+  const receiverKey = await jose.JWK.createKey("EC", "P-256", { alg: "ES256", use: "sig" });
+
+  const claimQrRequest: GnapTxRequestPayload = {
+    access_token: {
+      access: [gnap.access],
+    },
+    client: {
+      proof: "jws",
+      key: {
+        jwk: receiverKey.toJSON(false) as any,
+      },
+    },
+  };
+
   // * Claim the package (i.e., request an access token)
+  const claimQrResponse = await signedFetch(receiverKey)(gnap.url, {
+    method: "POST",
+    body: claimQrRequest,
+  }) as GnapTxResponsePayload;
+
+  const receiverAccessToken = claimQrResponse.access_token.value;
+
+  console.log("Claimed QR for package", JSON.stringify(claimQrResponse, null, 2));
+
   // * Fetch the JSON files inside
+  const fetchOneFile = signedFetch(receiverKey, receiverAccessToken)
+
+  const allFiles = await Promise.all(claimQrResponse
+    .access_token
+    .access
+    .flatMap(a => a.locations)
+    .map(async (l) => await fetchOneFile(l)))
+
+  console.log("Got all files", allFiles.map(b => "Entries: " + b.entry.length))
+
 }
 test();
