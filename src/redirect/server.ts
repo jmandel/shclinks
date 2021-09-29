@@ -4,6 +4,7 @@ import express from "express";
 import fetch from "node-fetch";
 import { PORT, PUBLIC_URL } from "./config";
 import resources from "./resources.json";
+import jose from "node-jose";
 
 interface ResourceAccessRights {
   type: "shclink-view";
@@ -32,18 +33,18 @@ interface QRDetails {
     clientName?: string;
     clientSpecificUrl: string;
     queryLog: string[];
-    locationAlias: Record<string,string>
+    locationAlias: Record<string, string>;
   }[];
 }
 
+const randomId = () => base64url.encode(crypto.randomBytes(32));
 const app = express();
 app.use(express.json());
-
-const randomId = () => base64url.encode(crypto.randomBytes(32));
-
-app.get("/", (req, res) => {
-  res.json(resources);
+app.listen(PORT, () => {
+  console.log(`Example app listening at http://localhost:${PORT}`);
+  e2etest();
 });
+
 
 type QRID = string;
 const QRs: Map<QRID, QRDetails> = new Map();
@@ -58,7 +59,7 @@ app.post("/qr", async (req, res) => {
   });
   res.json({
     url: `${PUBLIC_URL}/qr/${qrId}/claim`,
-    flags: "" + (qrCreationRequest.needPin ? "P" : "") + (qrCreationRequest.claimLimit ? "O" : ""),
+    flags: "L" + (qrCreationRequest.claimLimit ? "O" : "") + (qrCreationRequest.needPin ? "P" : ""),
     exp: qrCreationRequest.expireAfter,
   });
 });
@@ -85,15 +86,15 @@ app.post("/qr/:id/claim", (req, res) => {
     clientSpecificUrl,
     queryLog: [`Claimed: ${new Date()}`],
     locationAlias: Object.fromEntries(
-      Array.from(new Set(policy.request.access.flatMap(a => a.locations || [])).values())
-      .map(l => [l, randomId()]))
+      Array.from(new Set(policy.request.access.flatMap((a) => a.locations || [])).values()).map((l) => [l, randomId()])
+    ),
   });
 
   res.redirect(301, clientSpecificUrl);
 });
 
 app.get("/qr/:id/claimed/:cid", (req, res) => {
-  const {cid, id} = req.params;
+  const { cid, id } = req.params;
   const policy = QRs.get(id);
 
   if (!policy) {
@@ -107,45 +108,81 @@ app.get("/qr/:id/claimed/:cid", (req, res) => {
     return res.json(`This QR has not been correctly claimed.`);
   }
 
-  res.json(policy.request.access.map(a => ({
-    ...a,
-    locations: a.locations?.map(l => `${PUBLIC_URL}/qr/${id}/claimed/${cid}/files/${claimDetails.locationAlias[l]}`)
-  })));
-
+  res.json(
+    policy.request.access.map((a) => ({
+      ...a,
+      locations: a.locations?.map((l) => `${PUBLIC_URL}/qr/${id}/claimed/${cid}/files/${claimDetails.locationAlias[l]}`),
+    }))
+  );
 });
 
-
 app.get("/qr/:id/claimed/:cid/files/:fileid", async (req, res) => {
-  const {cid, id, fileid} = req.params;
+  const { cid, id, fileid } = req.params;
   const policy = QRs.get(id)!;
   const claimDetails = policy.claims.find((c) => c.clientSpecificUrl === `/qr/${id}/claimed/${cid}`)!;
 
-  const trueLocation = Object.entries(claimDetails.locationAlias)
-    .filter(([original, clientSpecific]) => clientSpecific === fileid)[0][0];
+  const trueLocation = Object.entries(claimDetails.locationAlias).find(
+    ([original, clientSpecific]) => clientSpecific === fileid
+  )![0];
 
-  // TODO actually proxy this in a sane way
+  // TODO proxy this in a sane way
   const proxied = await fetch(trueLocation);
-  res.status(proxied.status)
-  res.header("Content-Type", proxied.headers.get("content-type") || "application/text")
-  res.send(await proxied.text())
+  res.status(proxied.status);
+  res.header("Content-Type", proxied.headers.get("content-type") || "application/text");
+  res.send(await proxied.text());
 });
 
+const keyFromPreimage = async (preImage: string) =>
+  jose.JWK.asKey({
+    alg: "A256GCM",
+    kty: "oct",
+    k: crypto.createHash("sha256").update(preImage).digest(),
+  });
+
+const encrypt = async (payloadMimeType: string, payload: string, keyPreimage: string) =>
+  jose.JWE.createEncrypt(
+    {
+      format: "compact",
+      fields: { payloadMimeType },
+    },
+    await keyFromPreimage(keyPreimage)
+  )
+    .update(payload)
+    .final();
+
+const decrypt = async (payload: string, keyPreimage: string) => {
+  const decrypted = await await jose.JWE.createDecrypt(await keyFromPreimage(keyPreimage)).decrypt(payload);
+  return {
+    payloadMimeType: (decrypted.header as any)["payloadMimeType"],
+    payload: decrypted.plaintext,
+  };
+};
+
 // Fake static file hosting with the magic of dynamic filtering
-app.get("/hosted/files/:unguessable/:file.json", (req, res) => {
+app.get("/hosted/fake-encryption/:fakeEncryptionKeyPreimage/:file.json", async (req, res) => {
   const fhirFilter = new RegExp(req.params.file.replace(".json", ""), "i");
   const filtered = resources.entry.filter((r) => JSON.stringify(r).match(fhirFilter));
-  res.json({ ...resources, entry: filtered });
+  const filePayload = JSON.stringify({ ...resources, entry: filtered });
+  const jwe = await encrypt("application/fhir+json", filePayload, req.params.fakeEncryptionKeyPreimage);
+
+  res.status(200);
+  res.header("Content-Type", "application/jose");
+  res.send(jwe);
 });
 
 export async function e2etest() {
+  const fakeEncryptionKey = randomId();
+
   const qrCreationRequest: QrCreationRequestBody = {
     needPin: "1234",
     access: [
       {
         type: "shclink-view",
         locations: [
-          `${PUBLIC_URL}/hosted/files/${randomId()}/vital.json`,
-          `${PUBLIC_URL}/hosted/files/${randomId()}/glucose.json`,
+          // normally we'd encrypt and upload these. But **for demo purposes**
+          // pretend they exist and have 'static' fileserver generate them on the fly
+          `${PUBLIC_URL}/hosted/fake-encryption/${fakeEncryptionKey}/vital.json`,
+          `${PUBLIC_URL}/hosted/fake-encryption/${fakeEncryptionKey}/glucose.json`,
         ],
         datatypes: ["application/fhir+json"],
       },
@@ -159,17 +196,26 @@ export async function e2etest() {
   }).then((r) => r.json())) as QrCreationResponseBody;
   console.log("Initialized QR", JSON.stringify(qrCreationResponse, null, 2), qrCreationResponse.url);
 
-  const manifest = (await fetch(qrCreationResponse.url + "?PIN=1234", {
+  const qrBody = {
+    ...qrCreationResponse,
+    decrypt: fakeEncryptionKey,
+  };
+  const qr = `shclink:/` + base64url.encode(JSON.stringify(qrBody));
+  console.log(qrBody)
+  console.log("QR to scan", qr)
+  // --- then in the client, `qr` is the onyl input needed
+
+  const manifest = (await fetch(qrBody.url + "?PIN=1234", {
     method: "POST",
   }).then((r) => r.json())) as ResourceAccessRights[];
   console.log("Got manifest", manifest);
 
-  const fetchOne = (u: string): Promise<object> => fetch(u).then((r) => r.json());
-  const allFiles = await Promise.all(manifest.flatMap((rar) => rar.locations || []).map((l) => fetchOne(l)));
-  console.log("Got files", allFiles);
+  const fetchOne = (u: string): Promise<string> => fetch(u).then((r) => r.text());
+  const allFiles = await Promise.all(
+    manifest.flatMap((rar) => rar.locations || []).map((l) => fetchOne(l).then((l) => decrypt(l, qrBody.decrypt)))
+  );
+  console.log(
+    "Got files",
+    allFiles.map((f) => [f.payloadMimeType, JSON.parse(f.payload.toString())])
+  );
 }
-
-app.listen(PORT, () => {
-  console.log(`Example app listening at http://localhost:${PORT}`);
-  e2etest();
-});
