@@ -203,7 +203,7 @@ export async function e2etest() {
   const qr = `shclink:/` + base64url.encode(JSON.stringify(qrBody));
   console.log(qrBody)
   console.log("QR to scan", qr)
-  // --- then in the client, `qr` is the onyl input needed
+  // --- then in the client, `qr` is the only input needed
 
   const manifest = (await fetch(qrBody.url + "?PIN=1234", {
     method: "POST",
