@@ -32,6 +32,7 @@ interface QRDetails {
     clientName?: string;
     clientSpecificUrl: string;
     queryLog: string[];
+    locationAlias: Record<string,string>
   }[];
 }
 
@@ -78,17 +79,21 @@ app.post("/qr/:id/claim", (req, res) => {
   }
 
   const clientSpecificUrl = `/qr/${id}/claimed/${randomId()}`;
+
   policy.claims.push({
     clientName: (req.query.clientName as string) || "unknown",
     clientSpecificUrl,
     queryLog: [`Claimed: ${new Date()}`],
+    locationAlias: Object.fromEntries(
+      Array.from(new Set(policy.request.access.flatMap(a => a.locations || [])).values())
+      .map(l => [l, randomId()]))
   });
 
   res.redirect(301, clientSpecificUrl);
 });
 
 app.get("/qr/:id/claimed/:cid", (req, res) => {
-  const id = req.params.id;
+  const {cid, id} = req.params;
   const policy = QRs.get(id);
 
   if (!policy) {
@@ -102,7 +107,27 @@ app.get("/qr/:id/claimed/:cid", (req, res) => {
     return res.json(`This QR has not been correctly claimed.`);
   }
 
-  res.json(policy.request.access);
+  res.json(policy.request.access.map(a => ({
+    ...a,
+    locations: a.locations?.map(l => `${PUBLIC_URL}/qr/${id}/claimed/${cid}/files/${claimDetails.locationAlias[l]}`)
+  })));
+
+});
+
+
+app.get("/qr/:id/claimed/:cid/files/:fileid", async (req, res) => {
+  const {cid, id, fileid} = req.params;
+  const policy = QRs.get(id)!;
+  const claimDetails = policy.claims.find((c) => c.clientSpecificUrl === `/qr/${id}/claimed/${cid}`)!;
+
+  const trueLocation = Object.entries(claimDetails.locationAlias)
+    .filter(([original, clientSpecific]) => clientSpecific === fileid)[0][0];
+
+  // TODO actually proxy this in a sane way
+  const proxied = await fetch(trueLocation);
+  res.status(proxied.status)
+  res.header("Content-Type", proxied.headers.get("content-type") || "application/text")
+  res.send(await proxied.text())
 });
 
 // Fake static file hosting with the magic of dynamic filtering
