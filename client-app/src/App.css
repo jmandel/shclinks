@@ -10,6 +10,32 @@
   }
 }
 
+.qr-frame {
+  width: 300px;
+  height: 300px;
+  display: block;
+  position: relative;
+}
+
+.qr-main {
+  position: absolute;
+  width: 100%;
+  height: 100%;
+}
+
+.qr-logo {
+  background: white;
+  border: 10px solid white;
+  width: 30%;
+  position: absolute;
+  top: 0px;
+  bottom: 0px;
+  left: 0px;
+  right: 0px;
+  margin: auto;
+  display: block;
+}
+
 .App-header {
   background-color: #282c34;
   min-height: 10vh;

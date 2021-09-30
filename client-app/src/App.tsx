@@ -91,7 +91,7 @@ startup();
 
 const qr = (s: string): Promise<string> => {
   return new Promise((resolve, reject) => {
-    QRCode.toDataURL(s, function (err: any, url: string) {
+    QRCode.toDataURL(s, {errorCorrectionLevel: 'M'}, function (err: any, url: string) {
       if (err) return reject(err);
       return resolve(url);
     });
@@ -249,8 +249,9 @@ function App() {
       {Object.values(appState?.qr || {}).filter(v => v.active).map((v: QrDbRecord) => (
         <>
           <h3>{v.access.length} files shared (PIN: {v.needPin})</h3>
-          <a target="_blank" href={toQrPayload(v)}>
-            <img src={derivedState?.qrDataUrl[v.id]} title={toQrPayload(v)}  />
+          <a className="qr-frame" target="_blank" href={toQrPayload(v)}>
+            <img className="qr-main" src={derivedState?.qrDataUrl[v.id]} title={toQrPayload(v)}  />
+            <img className="qr-logo" src="logo.svg"></img>
           </a>
           <button onClick={() => deactivateQr(v.id)}>Deactivate</button>
         </>
