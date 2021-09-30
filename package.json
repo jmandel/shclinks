@@ -4,6 +4,7 @@
   "description": "",
   "scripts": {
     "test": "echo \"Error: no test specified\" && exit 1",
+    "watch-oauth": "nodemon --exec ts-node src/oauth/server.ts",
     "watch-gnap": "nodemon --exec ts-node src/gnap/server.ts",
     "watch-redirect": "nodemon --exec ts-node src/redirect/server.ts"
   },
@@ -11,11 +12,13 @@
   "license": "ISC",
   "dependencies": {
     "@types/body-parser": "^1.19.1",
+    "@types/cors": "^2.8.12",
     "@types/express": "^4.17.13",
     "@types/node-fetch": "^2.5.12",
     "@types/node-jose": "^1.1.8",
     "base64url": "^3.0.1",
     "body-parser": "^1.19.0",
+    "cors": "^2.8.5",
     "cross-env": "^7.0.3",
     "dotenv": "^10.0.0",
     "express": "^4.17.1",
@@ -28,6 +31,7 @@
   },
   "devDependencies": {
     "@types/node": "^16.10.1",
-    "nodemon": "^2.0.13"
+    "nodemon": "^2.0.13",
+    "playwright": "^1.15.0"
   }
 }
