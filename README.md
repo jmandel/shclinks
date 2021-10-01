@@ -1,6 +1,6 @@
 # SMART QR Links
 
-This repository implements prototypes for a few different technical approach to
+This repository implements prototypes for a few different technical approaches to
 one core problem: how to make it easy and safe to share health data using QR
 codes? See:  [use cases and technical approaches](https://hackmd.io/kvyVFD5cQK2Bg1_vnXSh_Q).
 
